@@ -1,0 +1,760 @@
+---
+title: "pipewatch: Observability for R Data Pipelines"
+subtitle: "Monitoring, validation and alerting for Postgres-based R scripts"
+author: "Data Engineering"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 2
+    number_sections: true
+    theme: flatly
+    code_folding: hide
+---
+
+```{r setup, include=FALSE, purl=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# What this is
+
+`pipewatch` adds observability to an R script that reads from Postgres, processes
+data, and writes back to Postgres. You add **three lines** to a script, and it will:
+
+- **Profile** every source and target table (freshness, volume, distribution, schema, lineage).
+- **Compare** each run with the history stored in one central table, `pipeline_observability`.
+- **Block** a bad write *before* it happens, and roll it back if a problem shows up after.
+- **Alert** the person who ran the script, and optionally a Slack channel.
+
+No old data is stored. Each run's summary statistics become the baseline for the next run.
+
+This single document is the whole framework: documentation, code, an example, and
+self-tests. It is not an R package, so there is nothing to deploy.
+
+# Quick start
+
+**Step 1. Extract the code once.** This pulls every code chunk out of this document into a plain R file.
+Put the file somewhere your team can read it, such as a shared drive or a Git repo.
+
+```{r quickstart-purl, eval=FALSE, purl=FALSE}
+knitr::purl("pipewatch.Rmd", output = "pipewatch.R", documentation = 0)
+```
+
+**Step 2. Create the log table (once per database).**
+
+```{r quickstart-schema, eval=FALSE, purl=FALSE}
+source("pipewatch.R")
+pw_install_schema(con)
+```
+
+**Step 3. Add three things to your script.**
+
+```{r quickstart-script, eval=FALSE, purl=FALSE}
+source("pipewatch.R")                                   # (1) load the framework
+
+pw_run("orders_pipeline", con, {                        # (2) wrap the script body
+
+  pw_source("raw.orders", key = "order_id", ts_col = "updated_at",
+            numeric_cols = "amount",
+            rules = c(amount_non_negative = "amount >= 0"))   # check the source first
+
+  df <- dbGetQuery(con, "SELECT * FROM raw.orders")     # your existing code
+  df_result <- df[df$amount > 0, ]                      # your existing code
+
+  pw_write(df_result, "mart.orders", key = "order_id",  # (3) instead of dbWriteTable()
+           ts_col = "updated_at", numeric_cols = "amount",
+           reconcile = list(source = "raw.orders", metrics = "sum_amount"))
+})
+```
+
+# What gets checked
+
+| Pillar | Check (metric name) | Needs history? | Warn | Fail |
+|---|---|---|---|---|
+| **Freshness** | Hours since the newest source timestamp (`freshness_hours`) | No | n/a | older than `max_age_hours` |
+| **Freshness** | Newest timestamp moved forward (`newest_ts_epoch`) | Yes | n/a | did not advance |
+| **Volume** | Row count vs baseline (`row_count`) | Yes | change of 30% | change of 50% |
+| **Volume** | Input vs output totals (`sum_<col>_reconciliation_diff`) | No | n/a | totals differ |
+| **Distribution** | Null rate per column (`null_rate_<col>`) | Yes | up 5 points | up 10 points |
+| **Distribution** | Duplicate keys (`duplicate_keys`) | No | n/a | any duplicate |
+| **Distribution** | Mean and sum of numeric columns (`mean_<col>`, `sum_<col>`) | Yes | change of 30% | change of 50% |
+| **Distribution** | Business rules (`rule_<name>`) | No | n/a | any violation |
+| **Schema** | Columns added, removed or retyped (`schema_changes`) | Yes | any change | n/a |
+| **Lineage** | Sources and target (`lineage`, `lineage_source`), plus `run_id`, `run_by`, `pipeline_name` on every row | No | n/a | n/a |
+| **Operational** | `run_duration_sec`, `pipeline_success`, error text in `notes` | No | n/a | run crashed |
+
+**How the baseline works.** The baseline for a metric is the *median of the last 10 runs*
+for that pipeline and table. Runs where that metric failed are excluded, so a bad load
+cannot become the new normal. On the first runs there is no baseline, so history-based
+checks pass and the profile is simply stored.
+
+**Learning mode.** The first 3 runs for each table are logged but never block. After that,
+a failed check stops the script.
+
+**Blocked runs.** The script stops with a message starting `BLOCKED:` that names the failed
+checks. Input checks stop before processing starts. Output checks roll the write back.
+If the change is legitimate (for example a real 50% drop), re-run with
+`pw_run(..., override = TRUE)`. Overridden failures are logged as warnings and tagged with
+your username, so the baseline can move to the new level.
+
+# The framework code
+
+Everything below is the framework. Click **Code** on the right to show or hide each block.
+
+## Load packages
+
+```{r packages}
+library(DBI)       # database connection
+library(dplyr)     # data manipulation
+library(tibble)    # tibble()
+library(jsonlite)  # notes column (JSON)
+library(uuid)      # run_id
+```
+
+## Settings
+
+```{r config}
+# Package-level state: the current run and the settings
+.pw <- new.env(parent = emptyenv())
+
+default_config <- function() {
+  list(
+    warn_change   = 0.30,  # relative change in counts / means / sums that warns
+    fail_change   = 0.50,  # ... and fails
+    null_warn     = 0.05,  # rise in null rate (absolute points) that warns
+    null_fail     = 0.10,  # ... and fails
+    max_age_hours = 24,    # source data older than this fails the freshness check
+    n_baseline    = 10,    # baseline = median of the last n runs
+    learning_runs = 3      # tables with fewer prior runs are logged but never block
+  )
+}
+
+pw_cfg <- function() {
+  if (is.null(.pw$config)) .pw$config <- default_config()
+  .pw$config
+}
+
+# Change settings for this R session, e.g. pw_config(max_age_hours = 48).
+# Call pw_config() with no arguments to see the current values.
+pw_config <- function(...) {
+  cfg  <- pw_cfg()
+  args <- list(...)
+  bad  <- setdiff(names(args), names(cfg))
+  if (length(bad)) stop("Unknown setting(s): ", paste(bad, collapse = ", "), call. = FALSE)
+  cfg[names(args)] <- args
+  .pw$config <- cfg
+  invisible(cfg)
+}
+
+current_ctx <- function() {
+  if (is.null(.pw$ctx))
+    stop("pw_source() and pw_write() must be called inside pw_run().", call. = FALSE)
+  .pw$ctx
+}
+
+# "schema.table" -> DBI identifier
+as_id <- function(table) {
+  parts <- strsplit(table, ".", fixed = TRUE)[[1]]
+  if (length(parts) == 2) Id(schema = parts[1], table = parts[2]) else Id(table = parts)
+}
+```
+
+## Metric helpers
+
+```{r metrics}
+# List -> JSON string for the `notes` column (NA when empty)
+to_json <- function(x) {
+  if (is.null(x)) NA_character_ else as.character(toJSON(x, auto_unbox = TRUE, null = "null"))
+}
+
+# One metric row, in the shape of the pipeline_observability table
+metric <- function(name, value, baseline = NA_real_, status = "ok", notes = NULL) {
+  tibble(metric_name    = name,
+         metric_value   = as.numeric(value),
+         baseline_value = as.numeric(baseline),
+         status         = status,
+         notes          = to_json(notes))
+}
+
+# Lineage (phase 1): which sources fed which target
+lineage_metric <- function(sources, target) {
+  metric("lineage", NA_real_, notes = list(sources = sources, target = target))
+}
+
+# Volume / reconciliation: does a total in the source equal the total in the target?
+check_reconciliation <- function(source_value, target_value,
+                                 name = "reconciliation_diff", tol = 0.01) {
+  diff <- target_value - source_value
+  metric(name, diff, baseline = 0, status = if (abs(diff) <= tol) "ok" else "fail")
+}
+
+# Compare one metric (e.g. "sum_amount") between the input and output of this run
+reconcile_metric <- function(m_in, m_out, name, tol = 0.01) {
+  get <- function(m) m$metric_value[m$metric_name == name]
+  a <- get(m_in); b <- get(m_out)
+  if (length(a) != 1 || length(b) != 1)
+    stop("Cannot reconcile '", name, "': metric missing. Did you pass numeric_cols?", call. = FALSE)
+  check_reconciliation(a, b, paste0(name, "_reconciliation_diff"), tol)
+}
+```
+
+## Profiling: summary statistics computed inside Postgres
+
+One SQL query per table. Millions of rows never leave the database.
+
+```{r profile}
+# from_sql:     "raw.orders" or an aliased subquery "(SELECT ...) t"
+# key:          ONE column that should be unique
+# ts_col:       "last updated" timestamp column
+# numeric_cols: columns to track mean and sum for
+# rules:        named SQL conditions that must be TRUE, e.g. c(amount_ok = "amount >= 0")
+profile_sql <- function(con, from_sql, key, ts_col, numeric_cols = NULL, rules = NULL) {
+  q <- function(x) as.character(dbQuoteIdentifier(con, x))
+
+  # A zero-row query gives column names and types without reading any data
+  empty  <- dbGetQuery(con, paste("SELECT * FROM", from_sql, "LIMIT 0"))
+  cols   <- names(empty)
+  schema <- vapply(empty, function(x) class(x)[1], character(1))
+
+  sel <- c(
+    "count(*)::float8 AS row_count",
+    sprintf("count(DISTINCT %s)::float8 AS distinct_keys", q(key)),
+    sprintf("extract(epoch FROM max(%s))::float8 AS newest_ts_epoch", q(ts_col)),
+    sprintf("avg((%s IS NULL)::int)::float8 AS %s", q(cols), q(paste0("null_rate_", cols)))
+  )
+  if (length(numeric_cols)) sel <- c(sel,
+    sprintf("avg(%s)::float8 AS %s", q(numeric_cols), q(paste0("mean_", numeric_cols))),
+    sprintf("sum(%s)::float8 AS %s", q(numeric_cols), q(paste0("sum_", numeric_cols))))
+  if (length(rules)) sel <- c(sel,
+    sprintf("count(*) FILTER (WHERE NOT coalesce((%s), false))::float8 AS %s",
+            rules, q(paste0("rule_", names(rules)))))
+
+  res <- dbGetQuery(con, paste("SELECT", paste(sel, collapse = ", "), "FROM", from_sql))
+  list(values = unlist(res[1, ]), schema = schema)
+}
+
+# Raw profile -> metric rows (adds duplicates and data age)
+profile_to_metrics <- function(p) {
+  v <- p$values
+  bind_rows(
+    tibble(metric_name = names(v), metric_value = unname(v)),
+    tibble(metric_name = "duplicate_keys",
+           metric_value = v[["row_count"]] - v[["distinct_keys"]]),
+    tibble(metric_name = "freshness_hours",
+           metric_value = (as.numeric(Sys.time()) - v[["newest_ts_epoch"]]) / 3600)
+  ) %>% filter(metric_name != "distinct_keys")
+}
+```
+
+## Baselines, grading and schema comparison
+
+```{r baseline}
+# Median of the last n runs per metric, read from the central log table.
+# newest_ts_epoch uses only the previous run ("did the data advance?").
+# Runs where a metric FAILED are excluded, so a bad load cannot become the baseline.
+get_baselines <- function(con, pipeline, table_name, stage, n) {
+  dbGetQuery(con, "
+    SELECT metric_name,
+           percentile_cont(0.5) WITHIN GROUP (ORDER BY metric_value)::float8 AS baseline_value
+    FROM (
+      SELECT metric_name, metric_value,
+             row_number() OVER (PARTITION BY metric_name ORDER BY run_timestamp DESC) AS rn
+      FROM pipeline_observability
+      WHERE pipeline_name = $1 AND table_name = $2 AND stage = $3
+        AND status <> 'fail' AND metric_value IS NOT NULL
+    ) t
+    WHERE rn <= CASE WHEN metric_name = 'newest_ts_epoch' THEN 1 ELSE $4::int END
+    GROUP BY metric_name",
+    params = list(pipeline, table_name, stage, as.integer(n)))
+}
+
+# Grade today's metrics against the baselines
+grade_against_baseline <- function(m, base, cfg) {
+  m %>%
+    left_join(base, by = "metric_name") %>%    # first run: baseline is NA, nothing fails
+    mutate(
+      chg = abs(metric_value - baseline_value) / abs(baseline_value),
+      status = case_when(
+        # Freshness: data older than the agreed limit
+        metric_name == "freshness_hours" ~
+          if_else(metric_value > cfg$max_age_hours, "fail", "ok"),
+        # Freshness: newest timestamp must move forward vs the previous run
+        metric_name == "newest_ts_epoch" ~
+          if_else(!is.na(baseline_value) & metric_value <= baseline_value, "fail", "ok"),
+        # Duplicates and business rules: any violation fails (no history needed)
+        metric_name == "duplicate_keys" | startsWith(metric_name, "rule_") ~
+          if_else(metric_value > 0, "fail", "ok"),
+        # Null rates: absolute rise in points vs baseline
+        startsWith(metric_name, "null_rate_") ~ case_when(
+          is.na(baseline_value) ~ "ok",
+          metric_value - baseline_value >= cfg$null_fail ~ "fail",
+          metric_value - baseline_value >= cfg$null_warn ~ "warn",
+          TRUE ~ "ok"),
+        # Row count, means, sums: relative change vs baseline
+        is.na(chg) ~ "ok",
+        chg >= cfg$fail_change ~ "fail",
+        chg >= cfg$warn_change ~ "warn",
+        TRUE ~ "ok"),
+      status = coalesce(status, "warn"),        # NULL statistics never pass silently
+      notes  = NA_character_) %>%
+    select(metric_name, metric_value, baseline_value, status, notes)
+}
+
+# Schema: compare with the column list stored by the previous run
+check_schema_snapshot <- function(con, pipeline, table_name, stage, schema) {
+  snap <- metric("schema_snapshot", length(schema), notes = as.list(schema))
+
+  prev <- dbGetQuery(con, "
+    SELECT notes::text AS notes FROM pipeline_observability
+    WHERE pipeline_name = $1 AND table_name = $2 AND stage = $3
+      AND metric_name = 'schema_snapshot'
+    ORDER BY run_timestamp DESC LIMIT 1",
+    params = list(pipeline, table_name, stage))
+  if (nrow(prev) == 0) return(snap)             # first run: nothing to compare
+
+  old   <- unlist(fromJSON(prev$notes[1]))
+  added <- setdiff(names(schema), names(old))
+  gone  <- setdiff(names(old), names(schema))
+  both  <- intersect(names(schema), names(old))
+  typed <- both[schema[both] != old[both]]
+  n     <- length(added) + length(gone) + length(typed)
+
+  bind_rows(snap, metric("schema_changes", n, baseline = 0,
+                         status = if (n > 0) "warn" else "ok",
+                         notes  = if (n > 0) list(added = added, removed = gone,
+                                                  type_changed = typed)))
+}
+
+# Profile -> baselines -> grade -> schema, in one call
+run_profile_checks <- function(con, profile, pipeline, table_name, stage, cfg) {
+  base <- get_baselines(con, pipeline, table_name, stage, cfg$n_baseline)
+  bind_rows(
+    grade_against_baseline(profile_to_metrics(profile), base, cfg),
+    check_schema_snapshot(con, pipeline, table_name, stage, profile$schema)
+  )
+}
+```
+
+## The central log table
+
+The SQL is stored in R so `pw_install_schema()` can run it. Use `pw_print_schema()` if your
+DBA prefers to run it by hand.
+
+```{r schema}
+pw_schema_sql <- c(
+
+"CREATE TABLE IF NOT EXISTS pipeline_observability (
+  id             bigserial PRIMARY KEY,
+  run_id         uuid        NOT NULL,
+  pipeline_name  text        NOT NULL,
+  run_timestamp  timestamptz NOT NULL DEFAULT now(),
+  run_by         text,
+  stage          text        NOT NULL CHECK (stage IN ('input','output','ops')),
+  table_name     text,
+  metric_name    text        NOT NULL,
+  metric_value   numeric,
+  baseline_value numeric,
+  status         text        NOT NULL CHECK (status IN ('ok','warn','fail')),
+  notes          jsonb
+)",
+
+"CREATE INDEX IF NOT EXISTS idx_obs_history
+  ON pipeline_observability (pipeline_name, table_name, stage, metric_name, run_timestamp DESC)",
+
+"CREATE INDEX IF NOT EXISTS idx_obs_run ON pipeline_observability (run_id)",
+
+# One row per run with its worst status
+"CREATE OR REPLACE VIEW v_pipeline_run_summary AS
+SELECT run_id,
+       pipeline_name,
+       min(run_timestamp) AS run_timestamp,
+       max(run_by)        AS run_by,
+       CASE WHEN bool_or(status = 'fail') THEN 'fail'
+            WHEN bool_or(status = 'warn') THEN 'warn'
+            ELSE 'ok' END AS run_status,
+       count(*) FILTER (WHERE status = 'fail') AS n_fail,
+       count(*) FILTER (WHERE status = 'warn') AS n_warn
+FROM pipeline_observability
+GROUP BY run_id, pipeline_name",
+
+# Latest run per pipeline: point your dashboard here
+"CREATE OR REPLACE VIEW v_pipeline_latest AS
+SELECT DISTINCT ON (pipeline_name) *
+FROM v_pipeline_run_summary
+ORDER BY pipeline_name, run_timestamp DESC",
+
+# Every failed check in the last 7 days
+"CREATE OR REPLACE VIEW v_failed_checks_7d AS
+SELECT run_timestamp, pipeline_name, run_by, stage, table_name,
+       metric_name, metric_value, baseline_value, notes
+FROM pipeline_observability
+WHERE status = 'fail' AND run_timestamp > now() - interval '7 days'
+ORDER BY run_timestamp DESC"
+)
+
+# Create the table, indexes and views (safe to run repeatedly)
+pw_install_schema <- function(con) {
+  for (stmt in pw_schema_sql) dbExecute(con, stmt)
+  invisible(TRUE)
+}
+
+# Print the SQL so it can be run by hand
+pw_print_schema <- function() cat(paste0(pw_schema_sql, ";\n"), sep = "\n")
+```
+
+## Logging
+
+```{r logging}
+# Insert metric rows into the central table (explicit casts for uuid / timestamptz / jsonb)
+log_metrics <- function(con, metrics, run_id, pipeline, stage, table_name = NA_character_,
+                        run_ts = Sys.time(), run_by = Sys.info()[["user"]]) {
+  m <- metrics %>%
+    mutate(run_id = run_id, pipeline_name = pipeline, run_timestamp = run_ts,
+           run_by = run_by, stage = stage, table_name = table_name)
+
+  dbExecute(con, "
+    INSERT INTO pipeline_observability
+      (run_id, pipeline_name, run_timestamp, run_by, stage, table_name,
+       metric_name, metric_value, baseline_value, status, notes)
+    VALUES ($1::uuid, $2, $3::timestamptz, $4, $5, $6, $7, $8, $9, $10, $11::jsonb)",
+    params = unname(as.list(m[c("run_id", "pipeline_name", "run_timestamp", "run_by",
+                                "stage", "table_name", "metric_name", "metric_value",
+                                "baseline_value", "status", "notes")])))
+  invisible(metrics)
+}
+
+# How many earlier runs exist for this pipeline / table / stage? (used for learning mode)
+count_prior_runs <- function(con, pipeline, table_name, stage) {
+  as.numeric(dbGetQuery(con, "
+    SELECT count(DISTINCT run_id) AS n FROM pipeline_observability
+    WHERE pipeline_name = $1 AND table_name = $2 AND stage = $3",
+    params = list(pipeline, table_name, stage))$n)
+}
+```
+
+## Gate: block, override or learn
+
+```{r gate}
+# Decide what to do with graded metrics:
+#  - learning mode: too few earlier runs, so log but never block
+#  - override:      the person re-ran with override = TRUE. Fails are logged as warn
+#                   (so the baseline can move) and tagged with who overrode
+#  - block:         any fail otherwise
+decide_gate <- function(ctx, m, table_name, stage) {
+  cfg      <- pw_cfg()
+  prior    <- count_prior_runs(ctx$con, ctx$pipeline, table_name, stage)
+  learning <- prior < cfg$learning_runs
+  fails    <- m$metric_name[m$status == "fail"]
+
+  if (length(fails) > 0 && ctx$override) {
+    is_fail <- m$status == "fail"
+    m$status[is_fail] <- "warn"
+    m$notes[is_fail]  <- to_json(list(override_by = ctx$run_by))
+  }
+
+  warns <- m$metric_name[m$status == "warn"]
+  if (length(warns))
+    message("pipewatch warnings (", table_name, "): ", paste(warns, collapse = ", "))
+  if (learning)
+    message(sprintf("pipewatch: learning mode for %s (%d of %d baseline runs). Checks are logged but will not block.",
+                    table_name, prior, cfg$learning_runs))
+
+  list(m = m, fails = fails, learning = learning,
+       block = length(fails) > 0 && !ctx$override && !learning)
+}
+
+block_message <- function(table_name, stage, fails) {
+  sprintf("BLOCKED: %s checks failed for %s (%s). %s To override a legitimate change, re-run with pw_run(..., override = TRUE).",
+          stage, table_name, paste(fails, collapse = ", "),
+          if (stage == "input") "Processing did not start." else "The write was rolled back.")
+}
+```
+
+## Alerts
+
+Alerts always print to the console of whoever ran the script. To also post to Slack, set the
+environment variable `PIPEWATCH_SLACK_WEBHOOK` (needs the `httr2` package). For email or
+anything else, set `options(pipewatch.alert_fn = function(msg, ctx) ...)`.
+
+```{r notify}
+pw_notify <- function(ctx, level, title, details = "") {
+  msg <- sprintf("[%s] %s\npipeline: %s | run by: %s | run_id: %s\n%s",
+                 toupper(level), title, ctx$pipeline, ctx$run_by, ctx$run_id, details)
+  message(msg)
+
+  # Custom hook, e.g. to send an email
+  hook <- getOption("pipewatch.alert_fn")
+  if (is.function(hook)) try(hook(msg, ctx), silent = TRUE)
+
+  # Slack incoming webhook
+  url <- Sys.getenv("PIPEWATCH_SLACK_WEBHOOK")
+  if (nzchar(url) && requireNamespace("httr2", quietly = TRUE)) {
+    try(httr2::req_perform(httr2::req_body_json(httr2::request(url), list(text = msg))),
+        silent = TRUE)
+  }
+  invisible(msg)
+}
+```
+
+## The three functions developers use
+
+### `pw_run()`: wrap the whole script
+
+```{r pw-run}
+# Creates one run_id and timestamp, records who ran it, times the run, catches errors,
+# logs success / failure, and alerts on any failure or blocked write.
+#   pipeline: name of the pipeline, e.g. "orders_pipeline"
+#   con:      DBI connection to the database that holds pipeline_observability
+#   code:     the pipeline body, wrapped in { }
+#   override: TRUE lets a run through despite failed checks (logged with your username)
+pw_run <- function(pipeline, con, code, override = FALSE) {
+  ctx <- new.env(parent = emptyenv())
+  ctx$pipeline <- pipeline
+  ctx$con      <- con
+  ctx$run_id   <- UUIDgenerate()
+  ctx$run_ts   <- Sys.time()
+  ctx$run_by   <- Sys.info()[["user"]]
+  ctx$override <- override
+  ctx$sources  <- list()          # input metrics per source, used for reconciliation
+
+  .pw$ctx <- ctx
+  on.exit(.pw$ctx <- NULL, add = TRUE)
+
+  err <- tryCatch({ code; NULL }, error = function(e) e)
+
+  # Operational metrics: run time, success / failure, error message
+  secs <- as.numeric(difftime(Sys.time(), ctx$run_ts, units = "secs"))
+  ops <- bind_rows(
+    metric("run_duration_sec", secs),
+    metric("pipeline_success", is.null(err), baseline = 1,
+           status = if (is.null(err)) "ok" else "fail",
+           notes  = if (!is.null(err)) list(error = conditionMessage(err)))
+  )
+  try(log_metrics(con, ops, ctx$run_id, pipeline, "ops", NA_character_,
+                  ctx$run_ts, ctx$run_by), silent = TRUE)
+
+  if (!is.null(err)) {
+    blocked <- startsWith(conditionMessage(err), "BLOCKED")
+    pw_notify(ctx, if (blocked) "blocked" else "failed",
+              if (blocked) "Pipeline blocked by data checks" else "Pipeline failed",
+              conditionMessage(err))
+    stop(err)
+  }
+  invisible(TRUE)
+}
+```
+
+### `pw_source()`: check a source before using it
+
+```{r pw-source}
+# Profiles a SOURCE table, logs the profile, compares it with earlier runs,
+# and stops the pipeline if a check fails.
+#   from:         table ("raw.orders") or aliased subquery ("(SELECT ...) t")
+#   key:          ONE column that should be unique
+#   ts_col:       "last updated" timestamp column
+#   numeric_cols: columns to track mean and sum for
+#   rules:        named SQL conditions that must be TRUE, e.g. c(amount_ok = "amount >= 0")
+#   name:         label used in the log (defaults to `from`; set it for subqueries)
+pw_source <- function(from, key, ts_col, numeric_cols = NULL, rules = NULL, name = from) {
+  ctx <- current_ctx()
+  p <- profile_sql(ctx$con, from, key, ts_col, numeric_cols, rules)
+  m <- run_profile_checks(ctx$con, p, ctx$pipeline, name, "input", pw_cfg())
+  m <- bind_rows(m, metric("lineage_source", NA_real_, notes = list(source = name)))
+
+  d <- decide_gate(ctx, m, name, "input")
+  log_metrics(ctx$con, d$m, ctx$run_id, ctx$pipeline, "input", name, ctx$run_ts, ctx$run_by)
+  ctx$sources[[name]] <- d$m
+
+  if (d$block) stop(block_message(name, "input", d$fails), call. = FALSE)
+  invisible(d$m)
+}
+```
+
+### `pw_write()`: write a result safely
+
+```{r pw-write}
+# Writes inside a transaction, profiles the table, runs the checks, and rolls the write
+# back if anything fails. Log rows are written AFTER the transaction ends, so they
+# survive a rollback.
+#   df:        data frame to write
+#   table:     target table, e.g. "mart.orders"
+#   mode:      "truncate" (empty the table, keep its structure; default),
+#              "append", or "overwrite" (drops and recreates: loses indexes and grants)
+#   reconcile: list(source = "raw.orders", metrics = "sum_amount") checks totals match
+pw_write <- function(df, table, key, ts_col, numeric_cols = NULL, rules = NULL,
+                     reconcile = NULL, mode = c("truncate", "append", "overwrite")) {
+  mode  <- match.arg(mode)
+  ctx   <- current_ctx()
+  con   <- ctx$con
+  id    <- as_id(table)
+  from  <- as.character(dbQuoteIdentifier(con, id))
+  m_out <- NULL
+  err   <- NULL
+
+  ok <- tryCatch({
+    dbWithTransaction(con, {
+      if (mode == "truncate") {
+        dbExecute(con, paste("TRUNCATE", from))
+        dbAppendTable(con, id, df)
+      } else {
+        dbWriteTable(con, id, df, overwrite = (mode == "overwrite"), append = (mode == "append"))
+      }
+
+      p     <- profile_sql(con, from, key, ts_col, numeric_cols, rules)
+      m_out <- run_profile_checks(con, p, ctx$pipeline, table, "output", pw_cfg())
+
+      if (!is.null(reconcile)) {
+        src <- ctx$sources[[reconcile$source]]
+        if (is.null(src))
+          stop("Unknown source for reconciliation: ", reconcile$source, call. = FALSE)
+        for (nm in reconcile$metrics)
+          m_out <- bind_rows(m_out, reconcile_metric(src, m_out, nm))
+      }
+      m_out <- bind_rows(m_out, lineage_metric(names(ctx$sources), table))
+
+      d     <- decide_gate(ctx, m_out, table, "output")
+      m_out <- d$m
+      if (d$block) stop(block_message(table, "output", d$fails), call. = FALSE)
+    })
+    TRUE
+  }, error = function(e) { err <<- e; FALSE })
+
+  if (!is.null(m_out))
+    log_metrics(con, m_out, ctx$run_id, ctx$pipeline, "output", table, ctx$run_ts, ctx$run_by)
+  if (!ok) stop(err)
+  invisible(m_out)
+}
+```
+
+# Complete example
+
+```{r example, eval=FALSE, purl=FALSE}
+library(DBI)
+source("pipewatch.R")
+
+con <- dbConnect(RPostgres::Postgres(), dbname = "mydb")   # your usual connection
+
+pw_run("orders_pipeline", con, {
+
+  # 1. Declare and check the source BEFORE using it
+  pw_source("raw.orders", key = "order_id", ts_col = "updated_at",
+            numeric_cols = "amount",
+            rules = c(amount_non_negative = "amount >= 0"))
+
+  # 2. Your existing code, unchanged
+  df <- dbGetQuery(con, "SELECT * FROM raw.orders")
+  df_result <- df[df$amount > 0, ]
+
+  # 3. Write through pw_write() instead of dbWriteTable()
+  pw_write(df_result, "mart.orders", key = "order_id", ts_col = "updated_at",
+           numeric_cols = "amount",
+           reconcile = list(source = "raw.orders", metrics = "sum_amount"))
+})
+```
+
+**Using a query instead of a table.** Give the subquery an alias and a label:
+
+```{r example-subquery, eval=FALSE, purl=FALSE}
+pw_source("(SELECT * FROM raw.orders WHERE region = 'EU') t",
+          name = "raw.orders_eu", key = "order_id", ts_col = "updated_at")
+```
+
+**Changing thresholds** for this session:
+
+```{r example-config, eval=FALSE, purl=FALSE}
+pw_config(max_age_hours = 48, warn_change = 0.2, learning_runs = 5)
+```
+
+**Overriding a legitimate change** (for example, the source really did shrink by half):
+
+```{r example-override, eval=FALSE, purl=FALSE}
+pw_run("orders_pipeline", con, override = TRUE, {
+  # ... same body ...
+})
+```
+
+# Looking at the results
+
+Point your dashboard (Metabase, Grafana, Shiny) at these views.
+
+```{r queries, eval=FALSE, purl=FALSE}
+# Latest status of every pipeline
+dbGetQuery(con, "SELECT * FROM v_pipeline_latest")
+
+# Everything that failed in the last 7 days
+dbGetQuery(con, "SELECT * FROM v_failed_checks_7d")
+
+# History of one metric
+dbGetQuery(con, "
+  SELECT run_timestamp, metric_value, baseline_value, status
+  FROM pipeline_observability
+  WHERE pipeline_name = 'orders_pipeline' AND table_name = 'raw.orders'
+    AND metric_name = 'row_count'
+  ORDER BY run_timestamp DESC LIMIT 30")
+```
+
+# Self-test
+
+These tests check the grading rules and need no database. If any row shows `FALSE`,
+do not roll the framework out until it is fixed.
+
+```{r tests, purl=FALSE}
+cfg <- default_config()
+
+grade1 <- function(name, value, baseline) {
+  m    <- tibble(metric_name = name, metric_value = value)
+  base <- tibble(metric_name = name, baseline_value = baseline)
+  grade_against_baseline(m, base, cfg)$status
+}
+
+first_run <- grade_against_baseline(
+  tibble(metric_name = "row_count", metric_value = 5),
+  tibble(metric_name = character(), baseline_value = numeric()), cfg)$status
+
+tests <- tribble(
+  ~test,                                         ~expected, ~got,
+  "row count unchanged",                         "ok",   grade1("row_count", 200000, 200000),
+  "row count down 35%",                          "warn", grade1("row_count", 130000, 200000),
+  "row count halves (the 200k to 100k case)",    "fail", grade1("row_count", 100000, 200000),
+  "first run has no baseline, never fails",      "ok",   first_run,
+  "duplicate keys fail",                         "fail", grade1("duplicate_keys", 1, 0),
+  "no duplicates pass",                          "ok",   grade1("duplicate_keys", 0, 0),
+  "business rule violation fails",               "fail", grade1("rule_amount_non_negative", 3, 0),
+  "null rate up 11 points fails",                "fail", grade1("null_rate_x", 0.12, 0.01),
+  "null rate up 6 points warns",                 "warn", grade1("null_rate_x", 0.07, 0.01),
+  "null rate up 1 point passes",                 "ok",   grade1("null_rate_x", 0.02, 0.01),
+  "newest timestamp did not advance fails",      "fail", grade1("newest_ts_epoch", 1000, 1000),
+  "newest timestamp advanced passes",            "ok",   grade1("newest_ts_epoch", 2000, 1000),
+  "reconciliation equal totals",                 "ok",   check_reconciliation(100, 100)$status,
+  "reconciliation different totals",             "fail", check_reconciliation(100, 90)$status
+)
+tests$pass <- tests$expected == tests$got
+knitr::kable(tests)
+```
+
+# Troubleshooting and limits
+
+| Symptom | What to do |
+|---|---|
+| `must be called inside pw_run()` | Put `pw_source()` and `pw_write()` inside the braces of `pw_run()`. |
+| `BLOCKED: input checks failed ...` | Read the metric names in the message, then look at `v_failed_checks_7d`. Fix the source, or use `override = TRUE` if the change is real. |
+| Every run fails after a real, permanent change | Re-run once with `override = TRUE`. The override is logged as a warning, so the baseline moves. |
+| `Cannot reconcile ... metric missing` | Pass the column in `numeric_cols` in both `pw_source()` and `pw_write()`. |
+| Checks never block | The table is still in learning mode. See `learning_runs` in `pw_config()`. |
+
+**Known limits**
+
+- One key column per table in `pw_source()` and `pw_write()`.
+- `pw_write()` writes the whole data frame at once. For very large writes, write to a staging table first.
+- Profiling runs full-table aggregates. On very large tables, profile a partition or a recent slice with an aliased subquery.
+- Reconciliation assumes you did not deliberately drop or change rows.
+- The first logged runs become the baseline. Review them by hand once, and do not trust a first run you know was bad.
+- This code has not been tested against a live database. Knit this document to run the self-test, then try one pipeline on a copy of your data before rolling it out.
+
+# Suggested rollout
+
+1. **Pilot (1 to 2 weeks):** 2 or 3 pipelines in learning mode. Review the first logged runs by hand.
+2. **Roll out:** add the three changes to the remaining pipelines and turn on Slack alerts.
+3. **Harden:** add business rules per pipeline and tune thresholds from real history.
+4. **Later:** have downstream scripts check `v_pipeline_latest` before starting, add column-level lineage and run-duration baselines.
